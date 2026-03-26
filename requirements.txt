@@ -1,0 +1,4 @@
+python-telegram-bot==21.10
+obsws-python==1.7.2
+python-dotenv==1.1.0
+pyobjc-framework-Quartz
