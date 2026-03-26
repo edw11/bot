@@ -334,24 +334,22 @@ def scheduler_loop(chat_id: int):
         try:
             schedule = load_schedule()
             now = datetime.now()
-            current_day = now.strftime("%A").lower()  # e.g. "monday"
+            current_date = now.strftime("%Y-%m-%d")
             current_time = now.strftime("%H:%M")
+            changed = False
 
             for entry in schedule:
-                # Check if this class should start now
-                schedule_day = entry.get("day", "").lower()
+                schedule_date = entry.get("date", "")
                 schedule_time = entry.get("time", "")
 
-                if schedule_day == current_day and schedule_time == current_time:
-                    # Check if we already started this class today (prevent double-start)
-                    last_run = entry.get("last_run", "")
-                    today_str = now.strftime("%Y-%m-%d")
-                    if last_run == today_str:
+                if schedule_date == current_date and schedule_time == current_time:
+                    # Check if already started (prevent double-start)
+                    if entry.get("done"):
                         continue
 
-                    # Mark as run today
-                    entry["last_run"] = today_str
-                    save_schedule(schedule)
+                    # Mark as done
+                    entry["done"] = True
+                    changed = True
 
                     logger.info(f"Scheduler triggering class: {entry.get('name', 'Unknown')}")
                     session_thread = threading.Thread(
@@ -361,6 +359,13 @@ def scheduler_loop(chat_id: int):
                     )
                     session_thread.start()
                     break  # Only start one class at a time
+
+            # Clean up past classes that are done
+            schedule = [e for e in schedule if not (e.get("done") and e.get("date", "") < current_date)]
+            changed = True
+
+            if changed:
+                save_schedule(schedule)
 
         except Exception as e:
             logger.error(f"Scheduler error: {e}")
@@ -378,7 +383,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stop - Stop recording\n"
         "/status - Check status\n"
         "/schedule - View scheduled classes\n"
-        "/add <day> <HH:MM> <name> <zoom_link_or_id> [password] - Add a class\n"
+        "/add <YYYY-MM-DD> <HH:MM> <name> <zoom_link> - Add a class\n"
         "/remove <number> - Remove a scheduled class\n\n"
         "Or just send a Zoom link to join immediately."
     )
@@ -488,17 +493,21 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     schedule = load_schedule()
     if not schedule:
-        await update.message.reply_text("No classes scheduled.\n\nUse /add to add one:\n/add Monday 09:00 Math https://zoom.us/j/123?pwd=xxx")
+        await update.message.reply_text("No classes scheduled.\n\nUse /add to add one:\n/add 2026-04-01 09:00 Math https://zoom.us/j/123?pwd=xxx")
         return
 
     lines = ["Scheduled classes:\n"]
     for i, entry in enumerate(schedule, 1):
         name = entry.get("name", "Unknown")
-        day = entry.get("day", "?").capitalize()
+        date = entry.get("date", "?")
         t = entry.get("time", "?")
         mid = entry.get("meeting_id", "?")
-        pwd = "yes" if entry.get("password") else "no"
-        lines.append(f"{i}. {name} — {day} {t}\n   ID: {mid}, Password: {pwd}")
+        done = " (done)" if entry.get("done") else ""
+        try:
+            day_name = datetime.strptime(date, "%Y-%m-%d").strftime("%A")
+        except ValueError:
+            day_name = "?"
+        lines.append(f"{i}. {name} — {date} ({day_name}) {t}{done}\n   ID: {mid}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -506,32 +515,35 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add a scheduled class.
 
-    Format: /add <day> <HH:MM> <name> <zoom_link_or_id> [password]
-    Example: /add Monday 09:00 Math https://zoom.us/j/123456789?pwd=xxx
-    Example: /add Wednesday 14:30 Physics 123456789 mypassword
+    Format: /add <YYYY-MM-DD> <HH:MM> <name> <zoom_link_or_id> [password]
+    Example: /add 2026-04-01 09:00 Math https://zoom.us/j/123456789?pwd=xxx
+    Example: /add 2026-04-03 14:30 Physics 123456789 mypassword
     """
     if not is_authorized(update):
         return
 
     text = update.message.text
-    # Remove /add prefix
     args_text = text[4:].strip()
 
-    # Parse: day time name zoom_info [password]
-    parts = args_text.split(None, 3)  # Split into max 4 parts: day, time, name, rest
+    # Parse: date time name zoom_info [password]
+    parts = args_text.split(None, 3)
     if len(parts) < 4:
         await update.message.reply_text(
-            "Usage: /add <day> <HH:MM> <name> <zoom_link_or_id> [password]\n\n"
+            "Usage: /add <YYYY-MM-DD> <HH:MM> <name> <zoom_link>\n\n"
             "Examples:\n"
-            "/add Monday 09:00 Math https://zoom.us/j/123?pwd=xxx\n"
-            "/add Wednesday 14:30 Physics 123456789 mypassword"
+            "/add 2026-04-01 09:00 Math https://zoom.us/j/123?pwd=xxx\n"
+            "/add 2026-04-03 14:30 Physics 123456789 mypassword"
         )
         return
 
-    day = parts[0].lower()
-    valid_days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-    if day not in valid_days:
-        await update.message.reply_text(f"Invalid day. Use one of: {', '.join(d.capitalize() for d in valid_days)}")
+    date_str = parts[0]
+    try:
+        parsed_date = datetime.strptime(date_str, "%Y-%m-%d")
+        if parsed_date.date() < datetime.now().date():
+            await update.message.reply_text("That date is in the past.")
+            return
+    except ValueError:
+        await update.message.reply_text("Invalid date format. Use YYYY-MM-DD (e.g., 2026-04-01)")
         return
 
     time_str = parts[1]
@@ -542,10 +554,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = parts[2]
     zoom_text = parts[3]
 
-    # Parse zoom info from the remaining text
     meeting_id, password = parse_zoom_info(zoom_text)
     if not meeting_id:
-        # Try treating the rest as "id password"
         zoom_parts = zoom_text.split()
         if zoom_parts and zoom_parts[0].replace(" ", "").isdigit():
             meeting_id = zoom_parts[0].replace(" ", "")
@@ -555,20 +565,23 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     schedule = load_schedule()
+    day_name = parsed_date.strftime("%A")
     entry = {
         "name": name,
-        "day": day,
+        "date": date_str,
         "time": time_str,
         "meeting_id": meeting_id,
         "password": password or "",
     }
     schedule.append(entry)
+    # Sort by date and time
+    schedule.sort(key=lambda e: (e.get("date", ""), e.get("time", "")))
     save_schedule(schedule)
 
     await update.message.reply_text(
         f"Class scheduled!\n\n"
         f"Name: {name}\n"
-        f"Day: {day.capitalize()}\n"
+        f"Date: {date_str} ({day_name})\n"
         f"Time: {time_str}\n"
         f"Meeting ID: {meeting_id}\n"
         f"Password: {'set' if password else 'none'}"
