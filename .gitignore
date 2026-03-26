@@ -1,3 +1,4 @@
 .env
+schedule.json
 __pycache__/
 *.pyc

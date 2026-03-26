@@ -1,10 +1,12 @@
 import os
 import re
+import json
 import time
 import asyncio
 import subprocess
 import logging
 import threading
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -25,6 +27,23 @@ OBS_WS_PASSWORD = os.getenv("OBS_WS_PASSWORD", "")
 
 # Track active recording state
 active_session = {"recording": False, "monitor_thread": None}
+
+# Schedule file path
+SCHEDULE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schedule.json")
+
+
+def load_schedule() -> list:
+    """Load scheduled classes from JSON file."""
+    if os.path.exists(SCHEDULE_FILE):
+        with open(SCHEDULE_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+
+def save_schedule(schedule: list):
+    """Save scheduled classes to JSON file."""
+    with open(SCHEDULE_FILE, "w") as f:
+        json.dump(schedule, f, indent=2)
 
 
 def is_authorized(update: Update) -> bool:
@@ -270,16 +289,98 @@ def _send_telegram_sync(bot_token: str, chat_id: int, text: str):
         logger.error(f"Failed to send Telegram message: {e}")
 
 
+def run_scheduled_session(meeting_id: str, password: str, class_name: str, chat_id: int):
+    """Run a scheduled recording session (called from scheduler thread)."""
+    if active_session["recording"]:
+        _send_telegram_sync(BOT_TOKEN, chat_id, f"Cannot start scheduled class '{class_name}' — another recording is active.")
+        return
+
+    _send_telegram_sync(BOT_TOKEN, chat_id, f"Starting scheduled class: {class_name}\nMeeting ID: {meeting_id}")
+
+    try:
+        ensure_obs_running()
+        time.sleep(2)
+
+        open_zoom_meeting(meeting_id, password)
+        time.sleep(10)
+
+        obs_client = connect_obs()
+        setup_obs_zoom_capture(obs_client)
+        time.sleep(2)
+
+        start_obs_recording(obs_client)
+        active_session["recording"] = True
+
+        _send_telegram_sync(BOT_TOKEN, chat_id, f"Recording started for '{class_name}'! I'll notify you when it ends.")
+
+        monitor_thread = threading.Thread(
+            target=monitor_zoom_and_stop_recording,
+            args=(BOT_TOKEN, chat_id),
+            daemon=True,
+        )
+        active_session["monitor_thread"] = monitor_thread
+        monitor_thread.start()
+
+    except Exception as e:
+        logger.error(f"Error starting scheduled session: {e}")
+        active_session["recording"] = False
+        _send_telegram_sync(BOT_TOKEN, chat_id, f"Error starting scheduled class '{class_name}': {e}")
+
+
+def scheduler_loop(chat_id: int):
+    """Background thread that checks schedule every 30 seconds and starts sessions."""
+    logger.info("Scheduler started")
+    while True:
+        try:
+            schedule = load_schedule()
+            now = datetime.now()
+            current_day = now.strftime("%A").lower()  # e.g. "monday"
+            current_time = now.strftime("%H:%M")
+
+            for entry in schedule:
+                # Check if this class should start now
+                schedule_day = entry.get("day", "").lower()
+                schedule_time = entry.get("time", "")
+
+                if schedule_day == current_day and schedule_time == current_time:
+                    # Check if we already started this class today (prevent double-start)
+                    last_run = entry.get("last_run", "")
+                    today_str = now.strftime("%Y-%m-%d")
+                    if last_run == today_str:
+                        continue
+
+                    # Mark as run today
+                    entry["last_run"] = today_str
+                    save_schedule(schedule)
+
+                    logger.info(f"Scheduler triggering class: {entry.get('name', 'Unknown')}")
+                    session_thread = threading.Thread(
+                        target=run_scheduled_session,
+                        args=(entry["meeting_id"], entry.get("password", ""), entry.get("name", "Class"), chat_id),
+                        daemon=True,
+                    )
+                    session_thread.start()
+                    break  # Only start one class at a time
+
+        except Exception as e:
+            logger.error(f"Scheduler error: {e}")
+
+        time.sleep(30)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     await update.message.reply_text(
         "Zoom Class Recorder Bot\n\n"
         "Commands:\n"
-        "/join <meeting_id> <password> - Join a Zoom meeting and start recording\n"
-        "/stop - Manually stop recording\n"
-        "/status - Check current status\n\n"
-        "You can also just send a Zoom link or meeting details."
+        "/join <id> <password> - Join and record now\n"
+        "/stop - Stop recording\n"
+        "/status - Check status\n"
+        "/schedule - View scheduled classes\n"
+        "/add <day> <HH:MM> <name> <zoom_link_or_id> [password] - Add a class\n"
+        "/remove <number> - Remove a scheduled class\n\n"
+        "Or just send a Zoom link to join immediately."
     )
 
 
@@ -380,6 +481,123 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(status_text)
 
 
+async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all scheduled classes."""
+    if not is_authorized(update):
+        return
+
+    schedule = load_schedule()
+    if not schedule:
+        await update.message.reply_text("No classes scheduled.\n\nUse /add to add one:\n/add Monday 09:00 Math https://zoom.us/j/123?pwd=xxx")
+        return
+
+    lines = ["Scheduled classes:\n"]
+    for i, entry in enumerate(schedule, 1):
+        name = entry.get("name", "Unknown")
+        day = entry.get("day", "?").capitalize()
+        t = entry.get("time", "?")
+        mid = entry.get("meeting_id", "?")
+        pwd = "yes" if entry.get("password") else "no"
+        lines.append(f"{i}. {name} — {day} {t}\n   ID: {mid}, Password: {pwd}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a scheduled class.
+
+    Format: /add <day> <HH:MM> <name> <zoom_link_or_id> [password]
+    Example: /add Monday 09:00 Math https://zoom.us/j/123456789?pwd=xxx
+    Example: /add Wednesday 14:30 Physics 123456789 mypassword
+    """
+    if not is_authorized(update):
+        return
+
+    text = update.message.text
+    # Remove /add prefix
+    args_text = text[4:].strip()
+
+    # Parse: day time name zoom_info [password]
+    parts = args_text.split(None, 3)  # Split into max 4 parts: day, time, name, rest
+    if len(parts) < 4:
+        await update.message.reply_text(
+            "Usage: /add <day> <HH:MM> <name> <zoom_link_or_id> [password]\n\n"
+            "Examples:\n"
+            "/add Monday 09:00 Math https://zoom.us/j/123?pwd=xxx\n"
+            "/add Wednesday 14:30 Physics 123456789 mypassword"
+        )
+        return
+
+    day = parts[0].lower()
+    valid_days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    if day not in valid_days:
+        await update.message.reply_text(f"Invalid day. Use one of: {', '.join(d.capitalize() for d in valid_days)}")
+        return
+
+    time_str = parts[1]
+    if not re.match(r"^\d{2}:\d{2}$", time_str):
+        await update.message.reply_text("Invalid time format. Use HH:MM (e.g., 09:00, 14:30)")
+        return
+
+    name = parts[2]
+    zoom_text = parts[3]
+
+    # Parse zoom info from the remaining text
+    meeting_id, password = parse_zoom_info(zoom_text)
+    if not meeting_id:
+        # Try treating the rest as "id password"
+        zoom_parts = zoom_text.split()
+        if zoom_parts and zoom_parts[0].replace(" ", "").isdigit():
+            meeting_id = zoom_parts[0].replace(" ", "")
+            password = zoom_parts[1] if len(zoom_parts) > 1 else ""
+        else:
+            await update.message.reply_text("Could not parse Zoom meeting info. Include a Zoom link or meeting ID.")
+            return
+
+    schedule = load_schedule()
+    entry = {
+        "name": name,
+        "day": day,
+        "time": time_str,
+        "meeting_id": meeting_id,
+        "password": password or "",
+    }
+    schedule.append(entry)
+    save_schedule(schedule)
+
+    await update.message.reply_text(
+        f"Class scheduled!\n\n"
+        f"Name: {name}\n"
+        f"Day: {day.capitalize()}\n"
+        f"Time: {time_str}\n"
+        f"Meeting ID: {meeting_id}\n"
+        f"Password: {'set' if password else 'none'}"
+    )
+
+
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a scheduled class by number."""
+    if not is_authorized(update):
+        return
+
+    text = update.message.text
+    parts = text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await update.message.reply_text("Usage: /remove <number>\n\nUse /schedule to see the list.")
+        return
+
+    index = int(parts[1]) - 1
+    schedule = load_schedule()
+
+    if index < 0 or index >= len(schedule):
+        await update.message.reply_text(f"Invalid number. You have {len(schedule)} scheduled classes.")
+        return
+
+    removed = schedule.pop(index)
+    save_schedule(schedule)
+    await update.message.reply_text(f"Removed: {removed.get('name', 'Unknown')} — {removed.get('day', '?').capitalize()} {removed.get('time', '?')}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle plain messages that might contain Zoom links or meeting info."""
     if not is_authorized(update):
@@ -413,7 +631,18 @@ def main():
     app.add_handler(CommandHandler("join", cmd_join))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("schedule", cmd_schedule))
+    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Start the scheduler in a background thread
+    scheduler_thread = threading.Thread(
+        target=scheduler_loop,
+        args=(ALLOWED_USER_ID,),
+        daemon=True,
+    )
+    scheduler_thread.start()
 
     logger.info("Bot started. Waiting for commands...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
