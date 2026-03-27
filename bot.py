@@ -120,16 +120,43 @@ def open_zoom_meeting(meeting_id: str, password: str):
 
 
 def dismiss_zoom_popups():
-    """Dismiss Zoom popups like 'This meeting is being recorded' by clicking Got it."""
+    """Dismiss Zoom popups like 'This meeting is being recorded' by clicking Got it/OK."""
     script = '''
     tell application "System Events"
         tell process "zoom.us"
-            try
-                click button "Got it" of window 1
-            end try
-            try
-                click button "OK" of window 1
-            end try
+            set frontmost to true
+            delay 0.5
+            -- Try every window
+            repeat with w in (every window)
+                try
+                    click button "OK" of w
+                end try
+                try
+                    click button "Got it" of w
+                end try
+                -- Also check for buttons inside groups/sheets
+                try
+                    repeat with g in (every group of w)
+                        try
+                            click button "OK" of g
+                        end try
+                        try
+                            click button "Got it" of g
+                        end try
+                    end repeat
+                end try
+                -- Check sheets
+                try
+                    repeat with s in (every sheet of w)
+                        try
+                            click button "OK" of s
+                        end try
+                        try
+                            click button "Got it" of s
+                        end try
+                    end repeat
+                end try
+            end repeat
         end tell
     end tell
     '''
