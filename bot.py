@@ -21,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ALLOWED_USER_ID = int(os.getenv("TELEGRAM_USER_ID"))
+ALLOWED_USER_IDS = [int(uid.strip()) for uid in os.getenv("TELEGRAM_USER_ID", "").split(",") if uid.strip()]
 OBS_WS_PORT = int(os.getenv("OBS_WS_PORT", "4455"))
 OBS_WS_PASSWORD = os.getenv("OBS_WS_PASSWORD", "")
 
@@ -47,7 +47,7 @@ def save_schedule(schedule: list):
 
 
 def is_authorized(update: Update) -> bool:
-    return update.effective_user.id == ALLOWED_USER_ID
+    return update.effective_user.id in ALLOWED_USER_IDS
 
 
 def run_applescript(script: str) -> str:
@@ -634,7 +634,7 @@ def main():
         print("Error: TELEGRAM_BOT_TOKEN not set in .env")
         return
 
-    if not ALLOWED_USER_ID:
+    if not ALLOWED_USER_IDS:
         print("Error: TELEGRAM_USER_ID not set in .env")
         return
 
@@ -652,7 +652,7 @@ def main():
     # Start the scheduler in a background thread
     scheduler_thread = threading.Thread(
         target=scheduler_loop,
-        args=(ALLOWED_USER_ID,),
+        args=(ALLOWED_USER_IDS[0],),
         daemon=True,
     )
     scheduler_thread.start()
