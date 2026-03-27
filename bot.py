@@ -142,11 +142,18 @@ def dismiss_zoom_popups():
 
 
 def start_popup_dismisser():
-    """Background thread that keeps trying to dismiss Zoom popups for 2 minutes."""
+    """Background thread that presses Enter a few times after joining to dismiss the recording popup.
+
+    Waits 15 seconds (for waiting room + joining), then presses Enter 3 times
+    with gaps, then stops. This avoids continuous beeping and focus stealing.
+    """
     def _dismiss_loop():
-        for _ in range(40):  # Check every 3 seconds for 2 minutes
+        # Wait for the meeting to fully load and popup to appear
+        time.sleep(15)
+        # Press Enter a few times with gaps to catch the popup
+        for _ in range(3):
             dismiss_zoom_popups()
-            time.sleep(3)
+            time.sleep(5)
     t = threading.Thread(target=_dismiss_loop, daemon=True)
     t.start()
 
