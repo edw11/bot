@@ -119,6 +119,36 @@ def open_zoom_meeting(meeting_id: str, password: str):
 
 
 
+def dismiss_zoom_popups():
+    """Dismiss Zoom popups like 'This meeting is being recorded' by clicking Got it."""
+    script = '''
+    tell application "System Events"
+        tell process "zoom.us"
+            try
+                click button "Got it" of window 1
+            end try
+            try
+                click button "OK" of window 1
+            end try
+        end tell
+    end tell
+    '''
+    try:
+        run_applescript(script)
+    except Exception:
+        pass
+
+
+def start_popup_dismisser():
+    """Background thread that keeps trying to dismiss Zoom popups for 2 minutes."""
+    def _dismiss_loop():
+        for _ in range(40):  # Check every 3 seconds for 2 minutes
+            dismiss_zoom_popups()
+            time.sleep(3)
+    t = threading.Thread(target=_dismiss_loop, daemon=True)
+    t.start()
+
+
 def ensure_obs_running():
     """Launch OBS if not already running."""
     result = subprocess.run(
@@ -313,6 +343,7 @@ def run_scheduled_session(meeting_id: str, password: str, class_name: str, chat_
         time.sleep(2)
 
         open_zoom_meeting(meeting_id, password)
+        start_popup_dismisser()  # Auto-click "Got it" on recording consent popup
         time.sleep(10)
 
         obs_client = connect_obs()
@@ -417,6 +448,7 @@ async def start_join_session(update: Update, meeting_id: str, password: str, con
         # Step 2: Join Zoom meeting
         await update.message.reply_text("2/4 Joining Zoom meeting...")
         open_zoom_meeting(meeting_id, password)
+        start_popup_dismisser()  # Auto-click "Got it" on recording consent popup
         time.sleep(10)  # Wait for Zoom to fully join
 
         # Step 3: Setup OBS scene to capture Zoom
