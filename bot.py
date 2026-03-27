@@ -277,16 +277,20 @@ def monitor_zoom_and_stop_recording(bot_token: str, chat_id: int):
 
 
 def _send_telegram_sync(bot_token: str, chat_id: int, text: str):
-    """Send a Telegram message from a background thread using requests."""
+    """Send a Telegram message from a background thread using requests. Retries up to 3 times."""
     import urllib.request
     import urllib.parse
-    import json as _json
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
-    try:
-        urllib.request.urlopen(url, data, timeout=10)
-    except Exception as e:
-        logger.error(f"Failed to send Telegram message: {e}")
+    for attempt in range(3):
+        try:
+            urllib.request.urlopen(url, data, timeout=15)
+            logger.info(f"Telegram notification sent to {chat_id}")
+            return
+        except Exception as e:
+            logger.error(f"Telegram send attempt {attempt + 1}/3 failed: {e}")
+            if attempt < 2:
+                time.sleep(3)
 
 
 def run_scheduled_session(meeting_id: str, password: str, class_name: str, chat_id: int):
