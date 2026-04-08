@@ -526,6 +526,28 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error stopping recording: {e}")
 
 
+async def cmd_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start OBS recording only — no Zoom."""
+    if not is_authorized(update):
+        return
+
+    if active_session["recording"]:
+        await update.message.reply_text("Already recording. Use /stop to stop.")
+        return
+
+    try:
+        ensure_obs_running()
+        time.sleep(2)
+        obs_client = connect_obs()
+        setup_obs_zoom_capture(obs_client)
+        time.sleep(1)
+        start_obs_recording(obs_client)
+        active_session["recording"] = True
+        await update.message.reply_text("OBS recording started.")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
@@ -695,6 +717,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("join", cmd_join))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("record", cmd_record))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
     app.add_handler(CommandHandler("add", cmd_add))
